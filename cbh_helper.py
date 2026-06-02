@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import getpass
 import hashlib
 import html
 import io
@@ -100,6 +99,15 @@ class CredentialBundle:
     resource_account: str
     resource_password: str
     expires_at: float
+    candidate_key: str = ""
+    tab_id: str = ""
+    tab_title: str = ""
+    target_label: str = ""
+    resource_host: str = ""
+    resource_port: str = ""
+    resource_name: str = ""
+    updated_at: float = 0.0
+    updated_order: int = 0
 
     @property
     def remaining_seconds(self) -> int:
@@ -111,7 +119,106 @@ class CredentialBundle:
 class CredentialCache:
     def __init__(self) -> None:
         self.lock = threading.Lock()
-        self.bundle: CredentialBundle | None = None
+        self.sources_by_key: dict[str, dict[str, CredentialBundle]] = {}
+        self.selected_key: str | None = None
+        self.updated_order = 0
+
+    def _candidate_parts(
+        self,
+        target_command: str,
+        resource_account: str,
+        resource_host: str,
+        resource_port: str,
+    ) -> tuple[str, str, str]:
+        host = resource_host.strip()
+        port = resource_port.strip()
+        if not host or not port:
+            parsed = parse_target_command(target_command)
+            if parsed:
+                host = host or parsed[0]
+                port = port or parsed[1]
+        host_port = f"{host}:{port}" if host and port else host
+        account = resource_account.strip()
+        if host_port:
+            key = f"{host_port}|{account}"
+        else:
+            digest = hashlib.sha256(target_command.encode("utf-8")).hexdigest()[:16]
+            key = f"manual:{digest}|{account}"
+        return key, host, port
+
+    def _representative(self, sources: dict[str, CredentialBundle]) -> CredentialBundle:
+        return max(sources.values(), key=lambda item: (item.updated_order, item.updated_at))
+
+    def _prune_locked(self) -> None:
+        now = time.time()
+        empty_keys: list[str] = []
+        for key, sources in self.sources_by_key.items():
+            expired_tabs = [
+                tab_id
+                for tab_id, bundle in sources.items()
+                if bundle.expires_at <= now
+            ]
+            for tab_id in expired_tabs:
+                sources.pop(tab_id, None)
+            if not sources:
+                empty_keys.append(key)
+        for key in empty_keys:
+            self.sources_by_key.pop(key, None)
+        if self.selected_key and self.selected_key not in self.sources_by_key:
+            self.selected_key = None
+
+    def _state_locked(self) -> dict[str, Any]:
+        self._prune_locked()
+        candidates: list[dict[str, Any]] = []
+        for key, sources in self.sources_by_key.items():
+            bundle = self._representative(sources)
+            host_port = (
+                f"{bundle.resource_host}:{bundle.resource_port}"
+                if bundle.resource_host and bundle.resource_port
+                else bundle.resource_host
+            )
+            target_label = (
+                bundle.resource_name
+                or bundle.target_label
+                or host_port
+                or profile_name_from_command(bundle.target_command)
+            )
+            resource_account = bundle.resource_account.strip()
+            detail_parts = []
+            if resource_account:
+                detail_parts.append(resource_account)
+            else:
+                detail_parts.append("手动输入资源账号")
+            if host_port:
+                detail_parts.append(host_port)
+            candidates.append(
+                {
+                    "key": key,
+                    "label": target_label,
+                    "detail": " · ".join(detail_parts),
+                    "targetLabel": target_label,
+                    "targetCommand": bundle.target_command,
+                    "resourceAccount": resource_account,
+                    "resourceHost": bundle.resource_host,
+                    "resourcePort": bundle.resource_port,
+                    "resourceName": bundle.resource_name,
+                    "sourceTabId": bundle.tab_id,
+                    "sourceTabTitle": bundle.tab_title,
+                    "connectedAt": bundle.updated_at,
+                    "remainingSeconds": bundle.remaining_seconds,
+                }
+            )
+        candidates.sort(
+            key=lambda item: (
+                0 if item["key"] == self.selected_key else 1,
+                -float(item["connectedAt"]),
+            )
+        )
+        return {
+            "type": "localSshCandidates",
+            "selectedKey": self.selected_key or "",
+            "candidates": candidates,
+        }
 
     def set(
         self,
@@ -122,26 +229,78 @@ class CredentialCache:
         resource_account: str,
         resource_password: str,
         ttl_seconds: int,
-    ) -> None:
+        tab_id: str = "",
+        tab_title: str = "",
+        target_label: str = "",
+        resource_host: str = "",
+        resource_port: str = "",
+        resource_name: str = "",
+    ) -> dict[str, Any]:
+        tab_id = tab_id.strip() or "default"
+        key, host, port = self._candidate_parts(
+            target_command=target_command,
+            resource_account=resource_account,
+            resource_host=resource_host,
+            resource_port=resource_port,
+        )
+        now = time.time()
+        expires_at = float("inf") if ttl_seconds <= 0 else now + max(60, ttl_seconds)
         with self.lock:
-            self.bundle = CredentialBundle(
+            self._prune_locked()
+            self.updated_order += 1
+            had_candidates = bool(self.sources_by_key)
+            sources = self.sources_by_key.setdefault(key, {})
+            sources[tab_id] = CredentialBundle(
                 username=username,
                 password=password,
                 mfa_code=mfa_code,
                 target_command=target_command,
                 resource_account=resource_account,
                 resource_password=resource_password,
-                expires_at=float("inf") if ttl_seconds <= 0 else time.time() + max(60, ttl_seconds),
+                expires_at=expires_at,
+                candidate_key=key,
+                tab_id=tab_id,
+                tab_title=tab_title,
+                target_label=target_label,
+                resource_host=host,
+                resource_port=port,
+                resource_name=resource_name,
+                updated_at=now,
+                updated_order=self.updated_order,
             )
+            if not had_candidates:
+                self.selected_key = key
+            return self._state_locked()
+
+    def select(self, key: str) -> dict[str, Any]:
+        with self.lock:
+            self._prune_locked()
+            self.selected_key = key if key and key in self.sources_by_key else None
+            return self._state_locked()
+
+    def remove_tab(self, tab_id: str) -> dict[str, Any]:
+        tab_id = tab_id.strip()
+        if not tab_id:
+            return self.state()
+        with self.lock:
+            for sources in self.sources_by_key.values():
+                sources.pop(tab_id, None)
+            self._prune_locked()
+            return self._state_locked()
+
+    def state(self) -> dict[str, Any]:
+        with self.lock:
+            return self._state_locked()
 
     def get(self) -> CredentialBundle | None:
         with self.lock:
-            if self.bundle is None:
+            self._prune_locked()
+            if not self.selected_key:
                 return None
-            if self.bundle.expires_at <= time.time():
-                self.bundle = None
+            sources = self.sources_by_key.get(self.selected_key)
+            if not sources:
                 return None
-            return self.bundle
+            return self._representative(sources)
 
 
 CREDENTIAL_CACHE = CredentialCache()
@@ -168,10 +327,31 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
     return config
 
 
-def save_default_config(path: Path = CONFIG_PATH) -> None:
-    if not path.exists():
+def config_value_missing(value: Any) -> bool:
+    return value is None or value == "" or value == 0 or value == []
+
+
+def save_default_config(
+    path: Path = CONFIG_PATH,
+    config: dict[str, Any] | None = None,
+) -> None:
+    changed = False
+    if path.exists():
+        with path.open("r", encoding="utf-8") as f:
+            saved_config = json.load(f)
+    else:
+        saved_config = dict(DEFAULT_CONFIG)
+        changed = True
+
+    if config is not None:
+        for key in ("bastion_host", "bastion_port", "target_profiles", "target_command"):
+            if config_value_missing(saved_config.get(key)) and not config_value_missing(config.get(key)):
+                saved_config[key] = config[key]
+                changed = True
+
+    if changed:
         with path.open("w", encoding="utf-8") as f:
-            json.dump(DEFAULT_CONFIG, f, indent=2)
+            json.dump(saved_config, f, indent=2, ensure_ascii=False)
             f.write("\n")
 
 
@@ -706,12 +886,37 @@ class HelperHTTPHandler(BaseHTTPRequestHandler):
             self._send_html()
         elif path == "/health":
             self._send_json({"ok": True, "app": APP_NAME})
+        elif path == "/api/local-ssh/candidates":
+            self._send_json(CREDENTIAL_CACHE.state())
         elif path == "/ws":
             self._handle_ws()
         elif path.startswith("/static/"):
             self._send_static(path)
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
+
+    def do_POST(self) -> None:
+        path = self.path.split("?", 1)[0]
+        if path == "/api/local-ssh/select":
+            payload = self._read_json_body()
+            key = str(payload.get("key", ""))
+            self._send_json(CREDENTIAL_CACHE.select(key))
+        else:
+            self.send_error(HTTPStatus.NOT_FOUND)
+
+    def _read_json_body(self) -> dict[str, Any]:
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            length = 0
+        if length <= 0:
+            return {}
+        body = self.rfile.read(length)
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except json.JSONDecodeError:
+            return {}
+        return payload if isinstance(payload, dict) else {}
 
     def _send_json(self, payload: dict[str, Any]) -> None:
         body = json.dumps(payload).encode("utf-8")
@@ -789,6 +994,12 @@ def handle_web_terminal(ws: WebSocketConnection, config: dict[str, Any]) -> None
         resource_account = str(start.get("resourceAccount", "")).strip()
         resource_password = str(start.get("resourcePassword", ""))
         cache_for_cmd = bool(start.get("cacheForCmd", True))
+        tab_id = str(start.get("tabId", "")).strip()
+        tab_title = str(start.get("tabTitle", "")).strip()
+        target_label = str(start.get("targetLabel", "")).strip()
+        resource_host = str(start.get("resourceHost", "")).strip()
+        resource_port = str(start.get("resourcePort", "")).strip()
+        resource_name = str(start.get("resourceName", "")).strip()
         cols = int(start.get("cols", 100) or 100)
         rows = int(start.get("rows", 30) or 30)
         term = str(start.get("term", "xterm"))
@@ -811,7 +1022,7 @@ def handle_web_terminal(ws: WebSocketConnection, config: dict[str, Any]) -> None
         responder = PromptResponder(resource_account, resource_password)
         if cache_for_cmd:
             ttl = int(config.get("credential_cache_ttl_seconds", 0))
-            CREDENTIAL_CACHE.set(
+            local_ssh_state = CREDENTIAL_CACHE.set(
                 username=username,
                 password=password,
                 mfa_code=mfa_code,
@@ -819,11 +1030,18 @@ def handle_web_terminal(ws: WebSocketConnection, config: dict[str, Any]) -> None
                 resource_account=resource_account,
                 resource_password=resource_password,
                 ttl_seconds=ttl,
+                tab_id=tab_id,
+                tab_title=tab_title,
+                target_label=target_label,
+                resource_host=resource_host,
+                resource_port=resource_port,
+                resource_name=resource_name,
             )
             if ttl <= 0:
-                send_status("已为本地 SSH 缓存凭据，直到服务停止。")
+                send_status("已加入本地 SSH 连接选择，直到服务停止。")
             else:
-                send_status(f"已为本地 SSH 缓存凭据，有效期 {ttl} 秒。")
+                send_status(f"已加入本地 SSH 连接选择，有效期 {ttl} 秒。")
+            ws.send_json(local_ssh_state)
 
         def pump_remote() -> None:
             assert channel is not None
@@ -916,6 +1134,8 @@ def handle_web_terminal(ws: WebSocketConnection, config: dict[str, Any]) -> None
         ws.send_json({"type": "error", "text": str(exc)})
     finally:
         stop_event.set()
+        if "tab_id" in locals() and tab_id:
+            CREDENTIAL_CACHE.remove_tab(tab_id)
         if channel is not None:
             channel.close()
         if transport is not None:
@@ -1207,7 +1427,7 @@ def handle_local_exec_request(
     if cached is None:
         channel_write(
             channel,
-            f"No cached web credentials in this cbh-helper process (pid {os.getpid()}). Open the web terminal, connect successfully, and keep sharing enabled.\n",
+            f"No selected reusable web terminal in this cbh-helper process (pid {os.getpid()}). Connect a web terminal, keep local SSH sharing enabled, and select it in the Local SSH connection list.\n",
         )
         channel.send_exit_status(1)
         return
@@ -1389,11 +1609,11 @@ def handle_local_ssh_client(
             )
             if not suppress_cached_login_prelude:
                 if cached.remaining_seconds < 0:
-                    channel_write(channel, "Using cached web credentials.\n")
+                    channel_write(channel, "Using selected web terminal credentials.\n")
                 else:
                     channel_write(
                         channel,
-                        f"Using cached web credentials. Expires in {cached.remaining_seconds} seconds.\n",
+                        f"Using selected web terminal credentials. Expires in {cached.remaining_seconds} seconds.\n",
                     )
                 if responder.enabled:
                     channel_write(channel, "Resource account/password auto-answer is enabled.\n")
@@ -1403,26 +1623,11 @@ def handle_local_ssh_client(
                         "Resource account/password are not cached; enter target prompts manually.\n",
                     )
         else:
-            configured_user = str(config.get("bastion_username", "")).strip()
-            local_user = getpass.getuser().lower()
-            explicit_ssh_user = (
-                server.username
-                and server.username.lower() not in ("unknown", local_user)
+            channel_write(
+                channel,
+                "No selected reusable web terminal. Connect a web terminal, keep local SSH sharing enabled, and select it in the web page's Local SSH connection list.\n",
             )
-            if explicit_ssh_user:
-                default_user = server.username
-            else:
-                default_user = configured_user
-
-            if configured_user and (not explicit_ssh_user or default_user == configured_user):
-                username = configured_user
-                channel_write(channel, f"Bastion username: {username}\n")
-            else:
-                username = channel_read_line(channel, "Bastion username", default=default_user)
-            password = channel_read_line(channel, "Bastion password", secret=True)
-            mfa_code = channel_read_line(channel, "MFA code, press Enter to skip", secret=False)
-            target_command = str(config.get("target_command", "")).strip()
-            responder = PromptResponder("", "")
+            return
         if not suppress_cached_login_prelude:
             channel_write(channel, f"{APP_NAME} local SSH bridge\n")
             channel_write(
@@ -1735,16 +1940,156 @@ def render_index(config: dict[str, Any]) -> str:
       overflow-wrap: anywhere;
     }}
     .status.error {{ color: var(--danger); }}
+    .local-ssh-panel {{
+      margin-top: 16px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line);
+    }}
+    .local-ssh-title {{
+      margin: 0 0 8px;
+      font-size: 13px;
+      font-weight: 650;
+    }}
+    .local-ssh-command {{
+      margin: 0 0 10px;
+      color: var(--accent);
+      font-family: Consolas, monospace;
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }}
+    .local-ssh-list {{
+      display: grid;
+      gap: 8px;
+      max-height: 220px;
+      overflow: auto;
+    }}
+    .local-ssh-option {{
+      width: 100%;
+      height: auto;
+      padding: 9px 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #101418;
+      color: var(--text);
+      text-align: left;
+      font-weight: 500;
+    }}
+    .local-ssh-option.active {{
+      border-color: var(--accent);
+      background: #12241d;
+    }}
+    .local-ssh-option-title {{
+      display: block;
+      margin-bottom: 4px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 13px;
+    }}
+    .local-ssh-option-detail {{
+      display: block;
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-family: Consolas, monospace;
+      font-size: 12px;
+    }}
+    .local-ssh-empty {{
+      padding: 9px 10px;
+      border: 1px dashed var(--line);
+      border-radius: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }}
     .terminal-shell {{
+      display: grid;
+      grid-template-rows: auto 1fr;
       min-width: 0;
       min-height: 0;
-      padding: 10px;
       background: #0b0d0f;
     }}
-    #terminal {{
+    .terminal-tabbar {{
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+      padding: 8px 10px;
+      overflow: hidden;
+      border-bottom: 1px solid var(--line);
+      background: #121518;
+    }}
+    .terminal-tabs {{
+      display: flex;
+      gap: 6px;
+      min-width: 0;
+      overflow-x: auto;
+    }}
+    .terminal-tab {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      width: auto;
+      max-width: 260px;
+      height: 32px;
+      padding: 0 8px;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: #1a1f24;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+    }}
+    .terminal-tab.active {{
+      border-color: var(--accent);
+      color: var(--text);
+      background: #20272c;
+      box-shadow: inset 0 -2px 0 var(--accent);
+    }}
+    .terminal-tab-label {{
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
+    .terminal-tab-close,
+    .terminal-tab-add {{
+      width: 32px;
+      min-width: 32px;
+      height: 32px;
+      padding: 0;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: #161b20;
+      color: var(--text);
+      font-size: 16px;
+      line-height: 1;
+    }}
+    .terminal-tab-close {{
+      width: 20px;
+      min-width: 20px;
+      height: 20px;
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      font-size: 14px;
+    }}
+    .terminal-panes {{
+      min-width: 0;
+      min-height: 360px;
+      position: relative;
+      padding: 10px;
+      background: #0b0d0f;
+      overflow: hidden;
+    }}
+    .terminal-pane {{
+      display: none;
       width: 100%;
       height: 100%;
-      min-height: 360px;
+      min-height: 0;
+    }}
+    .terminal-pane.active {{
+      display: block;
     }}
     @media (max-width: 900px) {{
       header {{ grid-template-columns: 1fr; }}
@@ -1804,364 +2149,23 @@ def render_index(config: dict[str, Any]) -> str:
         </div>
       </form>
       <div id="status" class="status" data-i18n="idle">空闲。</div>
+      <div class="local-ssh-panel">
+        <div class="local-ssh-title" data-i18n="localSshConnection">本地 SSH 连接</div>
+        <div class="local-ssh-command">{ssh_command}</div>
+        <div id="local-ssh-list" class="local-ssh-list"></div>
+        <div id="local-ssh-status" class="status" data-i18n="localSshEmpty">连接一个终端并勾选共享后可用于本地 SSH。</div>
+      </div>
     </aside>
     <section class="terminal-shell" aria-label="terminal">
-      <div id="terminal"></div>
+      <div class="terminal-tabbar">
+        <div id="terminal-tabs" class="terminal-tabs"></div>
+        <button id="add-terminal-tab" class="terminal-tab-add" type="button" title="新建终端">+</button>
+      </div>
+      <div id="terminal-panes" class="terminal-panes"></div>
     </section>
   </main>
   <script id="target-profiles" type="application/json">{profile_json}</script>
-  <script>
-    const targetProfiles = JSON.parse(document.getElementById("target-profiles").textContent);
-    const translations = {{
-      zh: {{
-        title: "CBH 辅助连接",
-        bastion: "堡垒机",
-        target: "目标",
-        language: "语言",
-        bastionUsername: "堡垒机用户名",
-        bastionPassword: "堡垒机密码",
-        mfaCode: "MFA 验证码",
-        targetProfile: "目标资源",
-        targetSelector: "目标选择命令",
-        resourceAccountProfile: "资源账号选项",
-        customResourceAccount: "自定义账号",
-        resourceAccount: "资源账号",
-        resourcePassword: "资源密码",
-        shareLogin: "共享本次登录给本地 SSH",
-        connect: "连接",
-        reconnect: "重连",
-        idle: "空闲。",
-        ready: "就绪。",
-        connecting: "正在连接。",
-        disconnected: "已断开。",
-        connectionError: "连接错误。"
-      }},
-      en: {{
-        title: "CBH Helper",
-        bastion: "Bastion",
-        target: "Target",
-        language: "Language",
-        bastionUsername: "Bastion username",
-        bastionPassword: "Bastion password",
-        mfaCode: "MFA code",
-        targetProfile: "Target profile",
-        targetSelector: "Target selector",
-        resourceAccountProfile: "Resource account option",
-        customResourceAccount: "Custom account",
-        resourceAccount: "Resource account",
-        resourcePassword: "Resource password",
-        shareLogin: "Share this login with local SSH",
-        connect: "Connect",
-        reconnect: "Reconnect",
-        idle: "Idle.",
-        ready: "Ready.",
-        connecting: "Connecting.",
-        disconnected: "Disconnected.",
-        connectionError: "Connection error."
-      }}
-    }};
-    let currentLanguage = "zh";
-
-    function t(key) {{
-      return (translations[currentLanguage] && translations[currentLanguage][key]) || translations.zh[key] || key;
-    }}
-
-    function setLanguage(language) {{
-      currentLanguage = translations[language] ? language : "zh";
-      localStorage.setItem("cbh-helper-language", currentLanguage);
-      document.documentElement.lang = currentLanguage === "zh" ? "zh-CN" : "en";
-      document.querySelectorAll("[data-i18n]").forEach((node) => {{
-        const key = node.getAttribute("data-i18n");
-        if (key && translations[currentLanguage][key]) {{
-          node.textContent = translations[currentLanguage][key];
-        }}
-      }});
-      const accountSelect = document.getElementById("resource-account-profile");
-      if (accountSelect) {{
-        const customOption = accountSelect.querySelector("option[value='__custom__']");
-        if (customOption) {{
-          customOption.textContent = t("customResourceAccount");
-        }}
-      }}
-    }}
-
-    const terminal = new Terminal({{
-      cursorBlink: true,
-      convertEol: true,
-      fontFamily: "Consolas, 'Cascadia Mono', monospace",
-      fontSize: 14,
-      theme: {{
-        background: "#0b0d0f",
-        foreground: "#edf0f2",
-        cursor: "#32c48d"
-      }}
-    }});
-    const fitAddon = new FitAddon.FitAddon();
-    terminal.loadAddon(fitAddon);
-    terminal.open(document.getElementById("terminal"));
-    fitAddon.fit();
-    terminal.writeln(t("ready"));
-
-    const form = document.getElementById("login");
-    const button = document.getElementById("connect");
-    const reconnectButton = document.getElementById("reconnect");
-    const statusEl = document.getElementById("status");
-    const language = document.getElementById("language");
-    const targetSummary = document.getElementById("target-summary");
-    const targetProfile = document.getElementById("target-profile");
-    const targetCommand = document.getElementById("target-command");
-    const resourceAccountProfile = document.getElementById("resource-account-profile");
-    const resourceAccount = document.getElementById("resource-account");
-    const resourcePassword = document.getElementById("resource-password");
-    const defaultResourceAccount = resourceAccount.value || "root";
-    const resourcePasswordMemory = new Map();
-    const RESOURCE_ACCOUNT_CUSTOM = "__custom__";
-    let currentResourcePasswordKey = "";
-    let socket = null;
-    let wsKeepaliveTimer = null;
-
-    function selectedProfile() {{
-      return targetProfiles[Number(targetProfile.value || 0)] || targetProfiles[0] || {{}};
-    }}
-
-    function normalizeAccounts(profile) {{
-      const accounts = Array.isArray(profile.accounts) ? profile.accounts.slice() : [];
-      const legacyAccount = String(profile.resource_account || "").trim();
-      if (legacyAccount && !accounts.some((entry) => String(entry.account || "").trim() === legacyAccount)) {{
-        accounts.unshift({{
-          account: legacyAccount,
-          target_command: profile.target_command || "",
-          resource_password: ""
-        }});
-      }}
-      return accounts.filter((entry) => String(entry.account || "").trim());
-    }}
-
-    function passwordKey(profile, account, command) {{
-      return `${{profile.name || ""}}|${{command || ""}}|${{account || ""}}`;
-    }}
-
-    function rememberCurrentResourcePassword() {{
-      if (currentResourcePasswordKey) {{
-        resourcePasswordMemory.set(currentResourcePasswordKey, resourcePassword.value);
-      }}
-    }}
-
-    function setResourcePassword(profile, account, command, fallbackPassword = "") {{
-      currentResourcePasswordKey = passwordKey(profile, account, command);
-      resourcePassword.value = resourcePasswordMemory.has(currentResourcePasswordKey)
-        ? resourcePasswordMemory.get(currentResourcePasswordKey)
-        : fallbackPassword;
-    }}
-
-    function applyResourceAccount(profile, value) {{
-      const accounts = normalizeAccounts(profile);
-      const index = Number(value);
-      if (value !== RESOURCE_ACCOUNT_CUSTOM && Number.isInteger(index) && accounts[index]) {{
-        const accountProfile = accounts[index];
-        const account = String(accountProfile.account || "").trim();
-        const command = accountProfile.target_command || profile.target_command || "";
-        targetCommand.value = command;
-        resourceAccount.value = account;
-        resourceAccount.readOnly = true;
-        setResourcePassword(profile, account, command, accountProfile.resource_password || "");
-        return;
-      }}
-
-      const command = profile.target_command || "";
-      targetCommand.value = command;
-      resourceAccount.readOnly = false;
-      resourceAccount.value = profile.resource_account || resourceAccount.value || defaultResourceAccount;
-      setResourcePassword(profile, resourceAccount.value, command);
-    }}
-
-    function installResourceAccounts(profile) {{
-      resourceAccountProfile.innerHTML = "";
-      const customOption = document.createElement("option");
-      customOption.value = RESOURCE_ACCOUNT_CUSTOM;
-      customOption.textContent = t("customResourceAccount");
-      resourceAccountProfile.appendChild(customOption);
-
-      normalizeAccounts(profile).forEach((accountProfile, index) => {{
-        const option = document.createElement("option");
-        option.value = String(index);
-        option.textContent = accountProfile.account || `Account ${{index + 1}}`;
-        resourceAccountProfile.appendChild(option);
-      }});
-
-      resourceAccountProfile.value = RESOURCE_ACCOUNT_CUSTOM;
-      applyResourceAccount(profile, RESOURCE_ACCOUNT_CUSTOM);
-    }}
-
-    function applyProfile(index) {{
-      rememberCurrentResourcePassword();
-      const profile = targetProfiles[index] || targetProfiles[0] || {{}};
-      targetSummary.textContent = profile.name || profile.target_command || "";
-      targetCommand.value = profile.target_command || "";
-      installResourceAccounts(profile);
-    }}
-
-    function installProfiles() {{
-      targetProfiles.forEach((profile, index) => {{
-        const option = document.createElement("option");
-        option.value = String(index);
-        option.textContent = profile.name || profile.target_command || `Target ${{index + 1}}`;
-        targetProfile.appendChild(option);
-      }});
-      applyProfile(0);
-    }}
-
-    targetProfile.addEventListener("change", () => {{
-      applyProfile(Number(targetProfile.value || 0));
-    }});
-
-    resourceAccountProfile.addEventListener("change", () => {{
-      rememberCurrentResourcePassword();
-      applyResourceAccount(selectedProfile(), resourceAccountProfile.value);
-    }});
-
-    resourceAccount.addEventListener("input", () => {{
-      if (resourceAccountProfile.value === RESOURCE_ACCOUNT_CUSTOM) {{
-        const profile = selectedProfile();
-        currentResourcePasswordKey = passwordKey(profile, resourceAccount.value, targetCommand.value);
-      }}
-    }});
-
-    resourcePassword.addEventListener("input", () => {{
-      rememberCurrentResourcePassword();
-    }});
-
-    function setStatus(text, error = false) {{
-      statusEl.textContent = text;
-      statusEl.classList.toggle("error", error);
-    }}
-
-    language.value = localStorage.getItem("cbh-helper-language") || "zh";
-    setLanguage(language.value);
-    language.addEventListener("change", () => {{
-      setLanguage(language.value);
-    }});
-
-    function wsUrl() {{
-      const scheme = location.protocol === "https:" ? "wss" : "ws";
-      return `${{scheme}}://${{location.host}}/ws`;
-    }}
-
-    function stopWsKeepalive() {{
-      if (wsKeepaliveTimer) {{
-        clearInterval(wsKeepaliveTimer);
-        wsKeepaliveTimer = null;
-      }}
-    }}
-
-    function connectWebTerminal() {{
-      if (socket) {{
-        const previousSocket = socket;
-        stopWsKeepalive();
-        previousSocket.close();
-        socket = null;
-      }}
-      terminal.clear();
-      fitAddon.fit();
-      const nextSocket = new WebSocket(wsUrl());
-      socket = nextSocket;
-      button.disabled = true;
-      reconnectButton.disabled = true;
-      setStatus(t("connecting"));
-
-      nextSocket.addEventListener("open", () => {{
-        rememberCurrentResourcePassword();
-        const payload = {{
-          type: "start",
-          username: document.getElementById("username").value,
-          password: document.getElementById("password").value,
-          mfa: document.getElementById("mfa").value,
-          targetCommand: document.getElementById("target-command").value,
-          resourceAccount: document.getElementById("resource-account").value,
-          resourcePassword: document.getElementById("resource-password").value,
-          cacheForCmd: document.getElementById("cache-for-cmd").checked,
-          cols: terminal.cols,
-          rows: terminal.rows,
-          term: "xterm"
-        }};
-        nextSocket.send(JSON.stringify(payload));
-        stopWsKeepalive();
-        wsKeepaliveTimer = setInterval(() => {{
-          if (nextSocket.readyState === WebSocket.OPEN) {{
-            nextSocket.send(JSON.stringify({{ type: "noop" }}));
-          }}
-        }}, 30000);
-        reconnectButton.disabled = false;
-      }});
-
-      nextSocket.addEventListener("message", (event) => {{
-        const message = JSON.parse(event.data);
-        if (message.type === "data") {{
-          terminal.write(message.data);
-        }} else if (message.type === "status") {{
-          setStatus(message.text);
-          terminal.writeln(`\\r\\n[${{message.text}}]`);
-        }} else if (message.type === "error") {{
-          setStatus(message.text, true);
-          const errorLabel = currentLanguage === "zh" ? "错误" : "Error";
-          terminal.writeln(`\\r\\n[${{errorLabel}}] ${{message.text}}`);
-        }}
-      }});
-
-      nextSocket.addEventListener("close", () => {{
-        if (socket !== nextSocket) {{
-          return;
-        }}
-        stopWsKeepalive();
-        socket = null;
-        button.disabled = false;
-        reconnectButton.disabled = false;
-        setStatus(t("disconnected"));
-      }});
-
-      nextSocket.addEventListener("error", () => {{
-        if (socket !== nextSocket) {{
-          return;
-        }}
-        stopWsKeepalive();
-        socket = null;
-        button.disabled = false;
-        reconnectButton.disabled = false;
-        setStatus(t("connectionError"), true);
-      }});
-    }}
-
-    form.addEventListener("submit", (event) => {{
-      event.preventDefault();
-      rememberCurrentResourcePassword();
-      connectWebTerminal();
-    }});
-
-    reconnectButton.addEventListener("click", () => {{
-      rememberCurrentResourcePassword();
-      connectWebTerminal();
-    }});
-
-    terminal.onData((data) => {{
-      if (socket && socket.readyState === WebSocket.OPEN) {{
-        socket.send(JSON.stringify({{ type: "input", data }}));
-      }} else {{
-        setStatus(t("disconnected"), true);
-      }}
-    }});
-
-    window.addEventListener("resize", () => {{
-      fitAddon.fit();
-      if (socket && socket.readyState === WebSocket.OPEN) {{
-        socket.send(JSON.stringify({{
-          type: "resize",
-          cols: terminal.cols,
-          rows: terminal.rows
-        }}));
-      }}
-    }});
-    installProfiles();
-  </script>
+  <script src="/static/cbh-helper-app.js"></script>
 </body>
 </html>"""
 
@@ -2187,7 +2191,7 @@ def run_doctor(config: dict[str, Any]) -> int:
 
 
 def run_servers(config: dict[str, Any]) -> None:
-    save_default_config()
+    save_default_config(config=config)
     local_ssh = LocalSSHListener(config)
     local_ssh.start()
     local_ssh.ready.wait(5)
