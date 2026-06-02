@@ -1,0 +1,25 @@
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+.venv*/
+
+# Local analysis/index cache
+.codegraph/
+
+# PyInstaller build outputs
+build*/
+dist*/
+*.exe
+
+# Local runtime secrets and generated config exports
+cbh-helper.json
+*.key
+*AutoLoginConfig*.zip
+
+# Local logs and transient files
+*.log
+*.tmp
+*.bak
+*.swp
+Thumbs.db
+desktop.ini
