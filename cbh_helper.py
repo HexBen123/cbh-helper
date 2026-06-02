@@ -33,7 +33,7 @@ from paramiko.ssh_exception import (
 
 
 APP_NAME = "CBH Helper"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 logging.getLogger("paramiko.transport").setLevel(logging.CRITICAL)
@@ -871,7 +871,7 @@ class WebSocketConnection:
 
 
 class HelperHTTPHandler(BaseHTTPRequestHandler):
-    server_version = "CBHHelper/0.1"
+    server_version = "CBHHelper/0.2.0"
 
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
