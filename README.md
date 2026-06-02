@@ -6,6 +6,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 ![paramiko](https://img.shields.io/badge/paramiko-4.0.0-44A833)
+![Version](https://img.shields.io/badge/version-0.1.0-2E7D32)
 ![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?logo=windows&logoColor=white)
 
 </div>
@@ -31,6 +32,12 @@
 
 ```powershell
 .\cbh-helper.exe serve
+```
+
+查看版本：
+
+```powershell
+.\cbh-helper.exe --version
 ```
 
 **方式二：Python 源码**

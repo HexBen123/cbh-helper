@@ -34,6 +34,7 @@ from paramiko.ssh_exception import (
 
 
 APP_NAME = "CBH Helper"
+APP_VERSION = "0.1.0"
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 logging.getLogger("paramiko.transport").setLevel(logging.CRITICAL)
@@ -1562,7 +1563,7 @@ def render_index(config: dict[str, Any]) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{APP_NAME}</title>
+  <title>{APP_NAME} v{APP_VERSION}</title>
   <link rel="stylesheet" href="/static/xterm.css">
   <script src="/static/xterm.min.js"></script>
   <script src="/static/xterm-addon-fit.min.js"></script>
@@ -1605,6 +1606,12 @@ def render_index(config: dict[str, Any]) -> str:
       font-size: 18px;
       font-weight: 650;
       line-height: 1.2;
+    }}
+    .app-version {{
+      margin-left: 8px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 500;
     }}
     .meta {{
       display: flex;
@@ -1751,7 +1758,7 @@ def render_index(config: dict[str, Any]) -> str:
 <body>
   <header>
     <div>
-      <h1 data-i18n="title">CBH 辅助连接</h1>
+      <h1><span data-i18n="title">CBH 辅助连接</span><span class="app-version">v{APP_VERSION}</span></h1>
       <div class="meta">
         <span><span data-i18n="bastion">堡垒机</span> {bastion}</span>
         <span><span data-i18n="target">目标</span> <span id="target-summary">{selector}</span></span>
@@ -2193,7 +2200,7 @@ def run_servers(config: dict[str, Any]) -> None:
     browser_host = "127.0.0.1" if web_host in ("", "0.0.0.0", "::") else web_host
     web_url = f"http://{browser_host}:{web_port}"
 
-    print(f"{APP_NAME} started.")
+    print(f"{APP_NAME} v{APP_VERSION} started.")
     print(f"Web terminal: {web_url}")
     print(
         f"Local SSH:    ssh 127.0.0.1 -p {int(config['local_ssh_port'])}"
@@ -2219,7 +2226,12 @@ def run_servers(config: dict[str, Any]) -> None:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=APP_NAME)
+    parser = argparse.ArgumentParser(description=f"{APP_NAME} v{APP_VERSION}")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"{APP_NAME} v{APP_VERSION}",
+    )
     parser.add_argument(
         "--config",
         default=str(CONFIG_PATH),
