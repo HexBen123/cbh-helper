@@ -659,6 +659,7 @@
     renderLocalSshCandidates();
     if (activeTabId === tabId) {
       const next = terminalTabs[Math.min(index, terminalTabs.length - 1)];
+      activeTabId = "";
       activateTab(next.id);
     } else {
       renderTabs();
