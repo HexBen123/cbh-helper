@@ -18,7 +18,7 @@ import time
 import uuid
 import webbrowser
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -33,7 +33,7 @@ from paramiko.ssh_exception import (
 
 
 APP_NAME = "CBH Helper"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 logging.getLogger("paramiko.transport").setLevel(logging.CRITICAL)
@@ -75,6 +75,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "mcp_exec_strip_terminal_controls": True,
     "mcp_exec_serialize_login": True,
     "mcp_exec_login_lock_timeout_seconds": 120,
+    "mcp_exec_queue_enabled": True,
+    "mcp_exec_queue_wait_timeout_seconds": 120,
     "ssh_keepalive_seconds": 30,
     "websocket_keepalive_seconds": 30,
     "web_terminal_shell_keepalive_seconds": 60,
@@ -114,6 +116,26 @@ class CredentialBundle:
         if self.expires_at == float("inf"):
             return -1
         return max(0, int(self.expires_at - time.time()))
+
+
+@dataclass
+class LocalSSHChannelRequest:
+    kind: str
+    exec_command: str | None = None
+
+
+@dataclass
+class LocalExecWorkItem:
+    channel: paramiko.Channel
+    config: dict[str, Any]
+    command: str
+    cols: int
+    rows: int
+    term: str
+    queued_at: float = field(default_factory=time.time)
+    started: threading.Event = field(default_factory=threading.Event)
+    done: threading.Event = field(default_factory=threading.Event)
+    cancel_requested: threading.Event = field(default_factory=threading.Event)
 
 
 class CredentialCache:
@@ -304,7 +326,58 @@ class CredentialCache:
 
 
 CREDENTIAL_CACHE = CredentialCache()
-MCP_EXEC_LOGIN_LOCK = threading.Lock()
+MCP_EXEC_LIFECYCLE_LOCK = threading.Lock()
+MCP_EXEC_LOGIN_LOCK = MCP_EXEC_LIFECYCLE_LOCK
+
+
+class LocalExecQueue:
+    def __init__(self) -> None:
+        self.items: queue.Queue[LocalExecWorkItem] = queue.Queue()
+        self.worker_lock = threading.Lock()
+        self.worker: threading.Thread | None = None
+
+    def submit(self, item: LocalExecWorkItem) -> None:
+        self._ensure_worker()
+        self.items.put(item)
+
+    def _ensure_worker(self) -> None:
+        with self.worker_lock:
+            if self.worker is not None and self.worker.is_alive():
+                return
+            self.worker = threading.Thread(
+                target=self._worker_loop,
+                name="cbh-local-exec-queue",
+                daemon=True,
+            )
+            self.worker.start()
+
+    def _worker_loop(self) -> None:
+        while True:
+            item = self.items.get()
+            try:
+                if item.cancel_requested.is_set():
+                    continue
+                item.started.set()
+                if item.cancel_requested.is_set():
+                    continue
+                _run_local_exec_request(
+                    item.channel,
+                    item.config,
+                    item.command,
+                    cols=item.cols,
+                    rows=item.rows,
+                    term=item.term,
+                    cancel_event=item.cancel_requested,
+                )
+            except Exception as exc:
+                safe_channel_write(item.channel, f"Error: {exc}\n")
+                safe_send_exit_status(item.channel, 1)
+            finally:
+                item.done.set()
+                self.items.task_done()
+
+
+LOCAL_EXEC_QUEUE = LocalExecQueue()
 
 
 def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
@@ -871,7 +944,7 @@ class WebSocketConnection:
 
 
 class HelperHTTPHandler(BaseHTTPRequestHandler):
-    server_version = "CBHHelper/0.2.0"
+    server_version = "CBHHelper/0.2.1"
 
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
@@ -1145,13 +1218,36 @@ def handle_web_terminal(ws: WebSocketConnection, config: dict[str, Any]) -> None
 
 class LocalSSHServer(paramiko.ServerInterface):
     def __init__(self) -> None:
-        self.event = threading.Event()
+        self.request_lock = threading.Lock()
+        self.channel_requests: dict[int, LocalSSHChannelRequest] = {}
         self.username = ""
         self.term = "xterm"
         self.cols = 100
         self.rows = 30
         self.remote_channel: paramiko.Channel | None = None
-        self.exec_command: str | None = None
+
+    def _remember_channel_request(
+        self,
+        channel: paramiko.Channel,
+        request: LocalSSHChannelRequest,
+    ) -> None:
+        with self.request_lock:
+            self.channel_requests[channel.get_id()] = request
+
+    def pop_channel_request(
+        self,
+        channel: paramiko.Channel,
+        timeout_seconds: float,
+    ) -> LocalSSHChannelRequest | None:
+        deadline = time.time() + timeout_seconds
+        channel_id = channel.get_id()
+        while time.time() < deadline:
+            with self.request_lock:
+                request = self.channel_requests.pop(channel_id, None)
+            if request is not None:
+                return request
+            time.sleep(0.05)
+        return None
 
     def check_auth_none(self, username: str) -> int:
         self.username = username
@@ -1189,12 +1285,18 @@ class LocalSSHServer(paramiko.ServerInterface):
         return True
 
     def check_channel_shell_request(self, channel: paramiko.Channel) -> bool:
-        self.event.set()
+        self._remember_channel_request(
+            channel,
+            LocalSSHChannelRequest(kind="shell"),
+        )
         return True
 
     def check_channel_exec_request(self, channel: paramiko.Channel, command: bytes) -> bool:
-        self.exec_command = command.decode("utf-8", errors="replace")
-        self.event.set()
+        exec_command = command.decode("utf-8", errors="replace")
+        self._remember_channel_request(
+            channel,
+            LocalSSHChannelRequest(kind="exec", exec_command=exec_command),
+        )
         return True
 
     def check_channel_window_change_request(
@@ -1217,6 +1319,22 @@ class LocalSSHServer(paramiko.ServerInterface):
 
 def channel_write(channel: paramiko.Channel, text: str) -> None:
     channel.sendall(text.replace("\n", "\r\n").encode("utf-8", errors="replace"))
+
+
+def safe_channel_write(channel: paramiko.Channel, text: str) -> None:
+    try:
+        if not channel.closed:
+            channel_write(channel, text)
+    except OSError:
+        pass
+
+
+def safe_send_exit_status(channel: paramiko.Channel, status: int) -> None:
+    try:
+        if not channel.closed:
+            channel.send_exit_status(status)
+    except OSError:
+        pass
 
 
 def clean_terminal_text(text: str) -> str:
@@ -1329,9 +1447,12 @@ def wait_for_target_shell(
     remote_channel: paramiko.Channel,
     responder: PromptResponder,
     timeout_seconds: int,
+    cancel_event: threading.Event | None = None,
 ) -> bool:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
+        if cancel_event is not None and cancel_event.is_set():
+            return False
         if remote_channel.recv_ready():
             data = remote_channel.recv(8192)
             if not data:
@@ -1340,6 +1461,8 @@ def wait_for_target_shell(
             if responder.password_sent:
                 quiet_deadline = time.time() + 0.5
                 while time.time() < quiet_deadline:
+                    if cancel_event is not None and cancel_event.is_set():
+                        return False
                     if remote_channel.recv_ready():
                         more = remote_channel.recv(8192)
                         if not more:
@@ -1417,39 +1540,44 @@ def bridge_channels(
             break
 
 
-def handle_local_exec_request(
+def _run_local_exec_request(
     channel: paramiko.Channel,
     config: dict[str, Any],
-    server: LocalSSHServer,
     command: str,
+    *,
+    cols: int,
+    rows: int,
+    term: str,
+    cancel_event: threading.Event | None = None,
 ) -> None:
     cached = CREDENTIAL_CACHE.get()
     if cached is None:
-        channel_write(
+        safe_channel_write(
             channel,
             f"No selected reusable web terminal in this cbh-helper process (pid {os.getpid()}). Connect a web terminal, keep local SSH sharing enabled, and select it in the Local SSH connection list.\n",
         )
-        channel.send_exit_status(1)
+        safe_send_exit_status(channel, 1)
         return
 
     responder = PromptResponder(cached.resource_account, cached.resource_password)
     if not responder.enabled:
-        channel_write(
+        safe_channel_write(
             channel,
             "Cached resource account/password are missing. Fill Resource account and Resource password in the web terminal first.\n",
         )
-        channel.send_exit_status(1)
+        safe_send_exit_status(channel, 1)
         return
 
     remote_transport: paramiko.Transport | None = None
     remote_channel: paramiko.Channel | None = None
+    lifecycle_lock_acquired = False
     request_id = uuid.uuid4().hex
     begin_marker = f"__CBH_MCP_BEGIN_{request_id}__"
     end_marker = f"__CBH_MCP_END_{request_id}__"
     append_exit_code = bool(config.get("mcp_exec_append_exit_code", False))
     strip_controls = bool(config.get("mcp_exec_strip_terminal_controls", True))
-    serialize_login = bool(config.get("mcp_exec_serialize_login", True))
-    login_lock_timeout = int(config.get("mcp_exec_login_lock_timeout_seconds", 120))
+    serialize_lifecycle = bool(config.get("mcp_exec_serialize_login", True))
+    lifecycle_lock_timeout = int(config.get("mcp_exec_login_lock_timeout_seconds", 120))
 
     def emit_output(text: str) -> None:
         if not text:
@@ -1459,54 +1587,70 @@ def handle_local_exec_request(
         else:
             text = text.replace("\r\n", "\n").replace("\r", "\n")
         if text:
-            channel.sendall(text.encode("utf-8", errors="replace"))
+            if not channel.closed:
+                channel.sendall(text.encode("utf-8", errors="replace"))
 
     try:
-        login_lock_acquired = False
-        try:
-            if serialize_login:
-                login_lock_acquired = MCP_EXEC_LOGIN_LOCK.acquire(
-                    timeout=login_lock_timeout
-                )
-                if not login_lock_acquired:
-                    channel_write(
-                        channel,
-                        "Timed out waiting for another MCP exec login to finish.\n",
-                    )
-                    channel.send_exit_status(124)
-                    return
+        if cancel_event is not None and cancel_event.is_set():
+            safe_send_exit_status(channel, 130)
+            return
 
-            remote_transport, remote_channel = open_bastion_shell(
-                config,
-                username=cached.username,
-                password=cached.password,
-                mfa_code=cached.mfa_code,
-                cols=server.cols,
-                rows=server.rows,
-                term=server.term,
-                target_command_override=cached.target_command,
-                on_status=None,
+        if serialize_lifecycle:
+            lifecycle_lock_acquired = MCP_EXEC_LIFECYCLE_LOCK.acquire(
+                timeout=lifecycle_lock_timeout
             )
-
-            ready_timeout = int(config.get("mcp_exec_ready_timeout_seconds", 60))
-            if not wait_for_target_shell(remote_channel, responder, ready_timeout):
-                channel_write(
+            if not lifecycle_lock_acquired:
+                safe_channel_write(
                     channel,
-                    "Timed out before target shell became ready. Confirm the web terminal cached resource account/password and selected target profile.\n",
+                    "Timed out waiting for another MCP exec request to finish.\n",
                 )
-                channel.send_exit_status(1)
+                safe_send_exit_status(channel, 124)
                 return
 
-            remote_channel.sendall(b"stty -echo 2>/dev/null || true\r")
-            drain_remote_output(remote_channel)
+        if cancel_event is not None and cancel_event.is_set():
+            safe_send_exit_status(channel, 130)
+            return
 
-            wrapper = build_mcp_exec_wrapper(command, begin_marker, end_marker)
-            remote_channel.sendall(
-                (wrapper.replace("\n", "\r") + "\r").encode("utf-8", errors="replace")
+        remote_transport, remote_channel = open_bastion_shell(
+            config,
+            username=cached.username,
+            password=cached.password,
+            mfa_code=cached.mfa_code,
+            cols=cols,
+            rows=rows,
+            term=term,
+            target_command_override=cached.target_command,
+            on_status=None,
+        )
+
+        ready_timeout = int(config.get("mcp_exec_ready_timeout_seconds", 60))
+        if not wait_for_target_shell(
+            remote_channel,
+            responder,
+            ready_timeout,
+            cancel_event=cancel_event,
+        ):
+            if cancel_event is not None and cancel_event.is_set():
+                safe_send_exit_status(channel, 130)
+                return
+            safe_channel_write(
+                channel,
+                "Timed out before target shell became ready. Confirm the web terminal cached resource account/password and selected target profile.\n",
             )
-        finally:
-            if login_lock_acquired:
-                MCP_EXEC_LOGIN_LOCK.release()
+            safe_send_exit_status(channel, 1)
+            return
+
+        if cancel_event is not None and cancel_event.is_set():
+            safe_send_exit_status(channel, 130)
+            return
+
+        remote_channel.sendall(b"stty -echo 2>/dev/null || true\r")
+        drain_remote_output(remote_channel)
+
+        wrapper = build_mcp_exec_wrapper(command, begin_marker, end_marker)
+        remote_channel.sendall(
+            (wrapper.replace("\n", "\r") + "\r").encode("utf-8", errors="replace")
+        )
 
         buffer = ""
         capture_started = False
@@ -1514,10 +1658,19 @@ def handle_local_exec_request(
         deadline = time.time() + int(config.get("mcp_exec_timeout_seconds", 300))
         flush_limit = 65536
         keep_tail = max(len(end_marker) + 512, 4096)
+        remote_closed = False
         while time.time() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                safe_send_exit_status(channel, 130)
+                return
+            if channel.closed:
+                if cancel_event is not None:
+                    cancel_event.set()
+                return
             if remote_channel.recv_ready():
                 data = remote_channel.recv(8192)
                 if not data:
+                    remote_closed = True
                     break
                 text = data.decode("utf-8", errors="replace")
                 buffer += text
@@ -1539,33 +1692,102 @@ def handle_local_exec_request(
                         emit_output(before)
                     if append_exit_code:
                         emit_output(f"\nCBH_MCP_RC={exit_status}\n")
-                    channel.send_exit_status(exit_status)
+                    safe_send_exit_status(channel, exit_status)
                     return
                 if len(buffer) > flush_limit:
                     emit_output(buffer[:-keep_tail])
                     buffer = buffer[-keep_tail:]
             elif remote_channel.exit_status_ready():
+                remote_closed = True
                 break
             else:
                 time.sleep(0.05)
 
-        if buffer and capture_started:
+        if buffer:
             emit_output(buffer)
-        elif buffer:
-            emit_output(buffer)
-            channel_write(channel, "\nTimed out waiting for command start marker.\n")
-            channel.send_exit_status(124)
+
+        if not capture_started:
+            if remote_closed:
+                safe_channel_write(
+                    channel,
+                    "\nRemote channel closed before command start marker.\n",
+                )
+            else:
+                safe_channel_write(channel, "\nTimed out waiting for command start marker.\n")
+            safe_send_exit_status(channel, 124)
             return
-        channel_write(channel, "\nTimed out waiting for command completion marker.\n")
-        channel.send_exit_status(124)
+
+        if remote_closed:
+            safe_channel_write(
+                channel,
+                "\nRemote channel closed before command completion marker.\n",
+            )
+        else:
+            safe_channel_write(channel, "\nTimed out waiting for command completion marker.\n")
+        safe_send_exit_status(channel, 124)
     except Exception as exc:
-        channel_write(channel, f"Error: {exc}\n")
-        channel.send_exit_status(1)
+        safe_channel_write(channel, f"Error: {exc}\n")
+        safe_send_exit_status(channel, 1)
     finally:
         if remote_channel is not None:
             remote_channel.close()
         if remote_transport is not None:
             remote_transport.close()
+        if lifecycle_lock_acquired:
+            MCP_EXEC_LIFECYCLE_LOCK.release()
+
+
+def handle_local_exec_request(
+    channel: paramiko.Channel,
+    config: dict[str, Any],
+    server: LocalSSHServer,
+    command: str,
+) -> None:
+    if not bool(config.get("mcp_exec_queue_enabled", True)):
+        _run_local_exec_request(
+            channel,
+            config,
+            command,
+            cols=server.cols,
+            rows=server.rows,
+            term=server.term,
+        )
+        return
+
+    queue_wait_timeout = float(
+        config.get(
+            "mcp_exec_queue_wait_timeout_seconds",
+            config.get("mcp_exec_login_lock_timeout_seconds", 120),
+        )
+    )
+    item = LocalExecWorkItem(
+        channel=channel,
+        config=config,
+        command=command,
+        cols=server.cols,
+        rows=server.rows,
+        term=server.term,
+    )
+    LOCAL_EXEC_QUEUE.submit(item)
+    deadline = time.time() + queue_wait_timeout if queue_wait_timeout > 0 else None
+
+    while True:
+        if item.done.wait(0.1):
+            return
+        if channel.closed:
+            item.cancel_requested.set()
+            if not item.started.is_set():
+                item.done.set()
+            return
+        if deadline is not None and not item.started.is_set() and time.time() >= deadline:
+            item.cancel_requested.set()
+            safe_channel_write(
+                channel,
+                "Timed out waiting for queued MCP exec request to start.\n",
+            )
+            safe_send_exit_status(channel, 124)
+            item.done.set()
+            return
 
 
 def handle_local_ssh_client(
@@ -1585,85 +1807,91 @@ def handle_local_ssh_client(
         server = LocalSSHServer()
         transport.start_server(server=server)
         configure_transport_keepalive(transport, config)
-        channel = transport.accept(20)
-        if channel is None:
-            return
-        server.event.wait(15)
-        if not server.event.is_set():
-            channel.close()
-            return
-        if server.exec_command is not None:
-            handle_local_exec_request(channel, config, server, server.exec_command)
-            return
+        while transport.is_active():
+            channel = transport.accept(20)
+            if channel is None:
+                return
+            channel_request = server.pop_channel_request(channel, 15)
+            if channel_request is None:
+                channel.close()
+                channel = None
+                continue
+            if channel_request.exec_command is not None:
+                exec_command = channel_request.exec_command
+                handle_local_exec_request(channel, config, server, exec_command)
+                channel.close()
+                channel = None
+                continue
 
-        cached = CREDENTIAL_CACHE.get()
-        suppress_cached_login_prelude = False
-        if cached is not None:
-            username = cached.username
-            password = cached.password
-            mfa_code = cached.mfa_code
-            target_command = cached.target_command or str(config.get("target_command", "")).strip()
-            responder = PromptResponder(cached.resource_account, cached.resource_password)
-            suppress_cached_login_prelude = responder.enabled and bool(
-                config.get("local_ssh_suppress_cached_login_prelude", True)
-            )
-            if not suppress_cached_login_prelude:
-                if cached.remaining_seconds < 0:
-                    channel_write(channel, "Using selected web terminal credentials.\n")
-                else:
-                    channel_write(
-                        channel,
-                        f"Using selected web terminal credentials. Expires in {cached.remaining_seconds} seconds.\n",
-                    )
-                if responder.enabled:
-                    channel_write(channel, "Resource account/password auto-answer is enabled.\n")
-                else:
-                    channel_write(
-                        channel,
-                        "Resource account/password are not cached; enter target prompts manually.\n",
-                    )
-        else:
-            channel_write(
-                channel,
-                "No selected reusable web terminal. Connect a web terminal, keep local SSH sharing enabled, and select it in the web page's Local SSH connection list.\n",
-            )
-            return
-        if not suppress_cached_login_prelude:
-            channel_write(channel, f"{APP_NAME} local SSH bridge\n")
-            channel_write(
-                channel,
-                f"Bastion: {config['bastion_host']}:{config['bastion_port']}\n",
-            )
-            channel_write(channel, f"Target selector: {target_command}\n\n")
-
-        def status(message: str) -> None:
-            if not suppress_cached_login_prelude:
-                channel_write(channel, message + "\n")
-
-        remote_transport, remote_channel = open_bastion_shell(
-            config,
-            username=username,
-            password=password,
-            mfa_code=mfa_code,
-            cols=server.cols,
-            rows=server.rows,
-            term=server.term,
-            target_command_override=target_command,
-            on_status=None if suppress_cached_login_prelude else status,
-        )
-        server.remote_channel = remote_channel
-        if suppress_cached_login_prelude:
-            ready_timeout = int(config.get("mcp_exec_ready_timeout_seconds", 60))
-            if not wait_for_target_shell(remote_channel, responder, ready_timeout):
+            cached = CREDENTIAL_CACHE.get()
+            suppress_cached_login_prelude = False
+            if cached is not None:
+                username = cached.username
+                password = cached.password
+                mfa_code = cached.mfa_code
+                target_command = cached.target_command or str(config.get("target_command", "")).strip()
+                responder = PromptResponder(cached.resource_account, cached.resource_password)
+                suppress_cached_login_prelude = responder.enabled and bool(
+                    config.get("local_ssh_suppress_cached_login_prelude", True)
+                )
+                if not suppress_cached_login_prelude:
+                    if cached.remaining_seconds < 0:
+                        channel_write(channel, "Using selected web terminal credentials.\n")
+                    else:
+                        channel_write(
+                            channel,
+                            f"Using selected web terminal credentials. Expires in {cached.remaining_seconds} seconds.\n",
+                        )
+                    if responder.enabled:
+                        channel_write(channel, "Resource account/password auto-answer is enabled.\n")
+                    else:
+                        channel_write(
+                            channel,
+                            "Resource account/password are not cached; enter target prompts manually.\n",
+                        )
+            else:
                 channel_write(
                     channel,
-                    "Timed out before target shell became ready. Confirm the web terminal cached resource account/password and selected target profile.\n",
+                    "No selected reusable web terminal. Connect a web terminal, keep local SSH sharing enabled, and select it in the web page's Local SSH connection list.\n",
                 )
                 return
-            remote_channel.send("\r")
-        else:
-            channel_write(channel, "Connected. Handing over terminal.\n\n")
-        bridge_channels(channel, remote_channel, responder=responder)
+            if not suppress_cached_login_prelude:
+                channel_write(channel, f"{APP_NAME} local SSH bridge\n")
+                channel_write(
+                    channel,
+                    f"Bastion: {config['bastion_host']}:{config['bastion_port']}\n",
+                )
+                channel_write(channel, f"Target selector: {target_command}\n\n")
+
+            def status(message: str) -> None:
+                if not suppress_cached_login_prelude:
+                    channel_write(channel, message + "\n")
+
+            remote_transport, remote_channel = open_bastion_shell(
+                config,
+                username=username,
+                password=password,
+                mfa_code=mfa_code,
+                cols=server.cols,
+                rows=server.rows,
+                term=server.term,
+                target_command_override=target_command,
+                on_status=None if suppress_cached_login_prelude else status,
+            )
+            server.remote_channel = remote_channel
+            if suppress_cached_login_prelude:
+                ready_timeout = int(config.get("mcp_exec_ready_timeout_seconds", 60))
+                if not wait_for_target_shell(remote_channel, responder, ready_timeout):
+                    channel_write(
+                        channel,
+                        "Timed out before target shell became ready. Confirm the web terminal cached resource account/password and selected target profile.\n",
+                    )
+                    return
+                remote_channel.send("\r")
+            else:
+                channel_write(channel, "Connected. Handing over terminal.\n\n")
+            bridge_channels(channel, remote_channel, responder=responder)
+            return
     except KeyboardInterrupt:
         if channel is not None:
             channel_write(channel, "\nCanceled.\n")

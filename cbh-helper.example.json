@@ -12,6 +12,8 @@
   "mcp_exec_strip_terminal_controls": true,
   "mcp_exec_serialize_login": true,
   "mcp_exec_login_lock_timeout_seconds": 120,
+  "mcp_exec_queue_enabled": true,
+  "mcp_exec_queue_wait_timeout_seconds": 120,
   "ssh_keepalive_seconds": 30,
   "websocket_keepalive_seconds": 30,
   "web_terminal_shell_keepalive_seconds": 60,

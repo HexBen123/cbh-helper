@@ -6,7 +6,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 ![paramiko](https://img.shields.io/badge/paramiko-4.0.0-44A833)
-![Version](https://img.shields.io/badge/version-0.2.0-2E7D32)
+![Version](https://img.shields.io/badge/version-0.2.1-2E7D32)
 ![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?logo=windows&logoColor=white)
 
 </div>
@@ -113,7 +113,7 @@ ssh your-bastion-user@127.0.0.1 -p 10022
 
 ## 🤖 MCP 执行通道
 
-`ssh-mcp-server` 连接 `127.0.0.1:10022` 执行命令时，会复用网页终端缓存的凭据和目标 profile。命令被包装成目标机上的临时 Bash 脚本执行，工具会自动剥离 shell 提示符和 ANSI 控制字符，只返回命令实际输出。
+`ssh-mcp-server` 连接 `127.0.0.1:10022` 执行命令时，会复用网页终端缓存的凭据和目标 profile。命令被包装成目标机上的临时 Bash 脚本执行，工具会自动剥离 shell 提示符和 ANSI 控制字符，只返回命令实际输出。多个 MCP `exec` 请求会在 helper 进程内排队串行执行，避免并发命令同时穿过堡垒机交互链路。
 
 > [!NOTE]
 > 凭据缓存仅存在于单个 `cbh-helper` 进程内。若启动了多个实例，请确保网页终端和 `ssh-mcp-server` 连接的是同一个本地端口。
@@ -131,6 +131,7 @@ ssh your-bastion-user@127.0.0.1 -p 10022
 | `credential_cache_ttl_seconds` | `0` | 凭据缓存有效期，`0` = 进程存活期间一直有效 |
 | `ssh_keepalive_seconds` | `30` | SSH 协议层保活间隔（秒） |
 | `mcp_exec_timeout_seconds` | `300` | MCP 单条命令超时（秒） |
+| `mcp_exec_queue_wait_timeout_seconds` | `120` | MCP 命令等待队列开始执行的超时（秒） |
 
 > 完整配置项（含 MCP、保活等进阶选项）见 [`cbh-helper.example.json`](./cbh-helper.example.json)。
 
